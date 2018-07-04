@@ -26,7 +26,7 @@ use helpers::{Height, Milliseconds, Round, ValidatorId};
 use messages::{
     Message, Precommit, Prevote, PrevotesRequest, Propose, ProposeRequest, RawTransaction,
 };
-use storage::Database;
+use storage::{Database, ProofListIndex, proof_list_index};
 
 pub type TimestampingSandbox = Sandbox;
 
@@ -96,15 +96,13 @@ impl<'a> BlockBuilder<'a> {
         self
     }
 
-    pub fn with_prev_hash(mut self, prev_hash: &'a Hash) -> Self {
+    pub fn with_prev_hash(mut self, prev_hash: &Hash) -> Self {
         self.prev_hash = Some(*prev_hash);
         self
     }
 
-    pub fn with_tx_hash(mut self, individual_transaction_hash: &'a Hash) -> Self {
-        self.tx_hash = Some(*individual_transaction_hash);
-        self.tx_count = Some(1);
-        self
+    pub fn with_tx_hash(self, individual_transaction_hash: &Hash) -> Self {
+        self.with_txs_hashes(&[*individual_transaction_hash])
     }
 
     pub fn with_txs_hashes(mut self, tx_hashes: &[Hash]) -> Self {
@@ -115,7 +113,7 @@ impl<'a> BlockBuilder<'a> {
         self
     }
 
-    pub fn with_state_hash(mut self, state_hash: &'a Hash) -> Self {
+    pub fn with_state_hash(mut self, state_hash: &Hash) -> Self {
         self.state_hash = Some(*state_hash);
         self
     }
@@ -128,7 +126,7 @@ impl<'a> BlockBuilder<'a> {
             self.height.unwrap_or_else(|| self.sandbox.current_height()),
             self.tx_count.unwrap_or(0),
             &self.prev_hash.unwrap_or_else(|| self.sandbox.last_hash()),
-            &self.tx_hash.unwrap_or_else(Hash::zero),
+            &self.tx_hash.unwrap_or_else(proof_list_index::empty_hash),
             &self.state_hash
                 .unwrap_or_else(|| self.sandbox.last_state_hash()),
         )
@@ -238,7 +236,7 @@ pub fn empty_hash() -> Hash {
 }
 
 pub fn compute_txs_merkle_root(txs: &[Hash]) -> Hash {
-    use storage::{MemoryDB, ProofListIndex};
+    use storage::MemoryDB;
 
     let mut fork = MemoryDB::new().fork();
     let mut hashes = ProofListIndex::new("name", &mut fork);

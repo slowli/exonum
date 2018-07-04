@@ -22,9 +22,10 @@ use super::{
     },
 };
 use blockchain::{Block, SCHEMA_MAJOR_VERSION};
-use crypto::{CryptoHash, Hash};
+use crypto::CryptoHash;
 use helpers::{Height, Round};
 use messages::{Precommit, Prevote, Propose};
+use storage::proof_list_index;
 
 #[test]
 fn test_send_propose_and_prevote() {
@@ -104,7 +105,7 @@ fn test_get_lock_and_send_precommit() {
         HEIGHT_ONE,
         0,
         &sandbox.last_hash(),
-        &Hash::zero(),
+        &proof_list_index::empty_hash(),
         &sandbox.last_state_hash(),
     );
 
@@ -165,7 +166,7 @@ fn test_commit() {
         HEIGHT_ONE,
         0,
         &sandbox.last_hash(),
-        &Hash::zero(),
+        &proof_list_index::empty_hash(),
         &sandbox.last_state_hash(),
     );
 
