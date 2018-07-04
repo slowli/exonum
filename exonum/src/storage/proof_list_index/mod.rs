@@ -16,19 +16,81 @@
 
 pub use self::proof::{ListProof, ListProofError};
 
-use std::{cell::Cell, marker::PhantomData};
+use byteorder::{BigEndian, ByteOrder};
+
+use std::{borrow::Cow, cell::Cell, marker::PhantomData};
 
 use self::key::ProofListKey;
 use super::{
     base_index::{BaseIndex, BaseIndexIter}, indexes_metadata::IndexType, Fork, Snapshot,
     StorageKey, StorageValue,
 };
-use crypto::{hash, Hash, HashStream};
+use crypto::{hash, CryptoHash, Hash, HashStream, HASH_SIZE};
 
 mod key;
 mod proof;
 #[cfg(test)]
 mod tests;
+
+#[derive(Debug, Clone, Copy)]
+struct RootNode {
+    hash: Hash,
+    length: u64,
+}
+
+impl RootNode {
+    fn to_array(&self) -> [u8; HASH_SIZE + 8] {
+        let mut array = [0; HASH_SIZE + 8];
+        array[0..HASH_SIZE].copy_from_slice(self.hash.as_ref());
+        BigEndian::write_u64(&mut array[HASH_SIZE..], self.length);
+        array
+    }
+
+    fn height(&self) -> u8 {
+        self.length.next_power_of_two().trailing_zeros() as u8 + 1
+    }
+
+    fn node_hash(merkle_root: &Hash, height: u8) -> Hash {
+        HashStream::new()
+            .update(merkle_root.as_ref())
+            .update(&[height])
+            .hash()
+    }
+
+    fn update_hash(&mut self, merkle_root: &Hash) {
+        self.hash = Self::node_hash(merkle_root, self.height())
+    }
+}
+
+impl Default for RootNode {
+    fn default() -> Self {
+        RootNode {
+            hash: hash(&[0; HASH_SIZE + 1]),
+            length: 0,
+        }
+    }
+}
+
+impl CryptoHash for RootNode {
+    fn hash(&self) -> Hash {
+        self.hash
+    }
+}
+
+impl StorageValue for RootNode {
+    fn into_bytes(self) -> Vec<u8> {
+        self.to_array().to_vec()
+    }
+
+    fn from_bytes(value: Cow<[u8]>) -> Self {
+        let buf = value.as_ref();
+
+        let hash = Hash::from_slice(&buf[0..HASH_SIZE]).unwrap();
+        let length = BigEndian::read_u64(&buf[HASH_SIZE..]);
+
+        RootNode { hash, length }
+    }
+}
 
 // TODO: Implement pop and truncate methods for Merkle tree. (ECR-173)
 
@@ -41,7 +103,7 @@ mod tests;
 #[derive(Debug)]
 pub struct ProofListIndex<T, V> {
     base: BaseIndex<T>,
-    length: Cell<Option<u64>>,
+    root_node: Cell<Option<RootNode>>,
     _v: PhantomData<V>,
 }
 
@@ -63,6 +125,12 @@ fn pair_hash(h1: &Hash, h2: &Hash) -> Hash {
         .update(h1.as_ref())
         .update(h2.as_ref())
         .hash()
+}
+
+
+/// Hash of an empty index.
+pub fn empty_hash() -> Hash {
+    RootNode::node_hash(&Hash::zero(), 0)
 }
 
 impl<T, V> ProofListIndex<T, V>
@@ -96,7 +164,7 @@ where
     pub fn new<S: AsRef<str>>(index_name: S, view: T) -> Self {
         ProofListIndex {
             base: BaseIndex::new(index_name, IndexType::ProofList, view),
-            length: Cell::new(None),
+            root_node: Cell::new(None),
             _v: PhantomData,
         }
     }
@@ -135,14 +203,13 @@ where
     ) -> Self {
         ProofListIndex {
             base: BaseIndex::new_in_family(family_name, index_id, IndexType::ProofList, view),
-            length: Cell::new(None),
+            root_node: Cell::new(None),
             _v: PhantomData,
         }
     }
 
     fn has_branch(&self, key: ProofListKey) -> bool {
         debug_assert!(key.height() > 0);
-
         key.first_left_leaf_index() < self.len()
     }
 
@@ -156,35 +223,33 @@ where
 
     fn get_branch_unchecked(&self, key: ProofListKey) -> Hash {
         debug_assert!(self.has_branch(key));
-
         self.base.get(&key).unwrap()
     }
 
-    fn root_key(&self) -> ProofListKey {
-        ProofListKey::new(self.height(), 0)
-    }
+    fn construct_proof(&self, from: u64, to: u64) -> ListProof<V> {
+        let items = (from..to)
+            .into_iter()
+            .zip(self.iter_from(from).take((to - from) as usize));
+        let mut proof = ListProof::new(items, self.height());
 
-    fn construct_proof(&self, key: ProofListKey, from: u64, to: u64) -> ListProof<V> {
-        if key.height() == 1 {
-            return ListProof::Leaf(self.get(key.index()).unwrap());
+        let (mut left, mut right) = (from, to - 1);
+        for height in 1..self.height() {
+            if left % 2 == 1 {
+                let hash = self.get_branch_unchecked(ProofListKey::new(height, left - 1));
+                proof.push_hash(height, left - 1, hash);
+            }
+
+            if right % 2 == 0 {
+                if let Some(hash) = self.get_branch(ProofListKey::new(height, right + 1)) {
+                    proof.push_hash(height, right + 1, hash);
+                }
+            }
+
+            left >>= 1;
+            right >>= 1;
         }
-        let middle = key.first_right_leaf_index();
-        if to <= middle {
-            ListProof::Left(
-                Box::new(self.construct_proof(key.left(), from, to)),
-                self.get_branch(key.right()),
-            )
-        } else if middle <= from {
-            ListProof::Right(
-                self.get_branch_unchecked(key.left()),
-                Box::new(self.construct_proof(key.right(), from, to)),
-            )
-        } else {
-            ListProof::Full(
-                Box::new(self.construct_proof(key.left(), from, middle)),
-                Box::new(self.construct_proof(key.right(), middle, to)),
-            )
-        }
+
+        proof
     }
 
     /// Returns the element at the indicated position or `None` if the indicated position
@@ -251,6 +316,15 @@ where
         self.len() == 0
     }
 
+    fn root_node(&self) -> RootNode {
+        if self.root_node.get().is_none() {
+            let root_node = self.base.get(&()).unwrap_or_default();
+            self.root_node.set(Some(root_node));
+        }
+
+        self.root_node.get().unwrap()
+    }
+
     /// Returns the number of elements in the proof list.
     ///
     /// # Examples
@@ -268,12 +342,7 @@ where
     /// assert_eq!(1, index.len());
     /// ```
     pub fn len(&self) -> u64 {
-        if let Some(len) = self.length.get() {
-            return len;
-        }
-        let len = self.base.get(&()).unwrap_or(0);
-        self.length.set(Some(len));
-        len
+        self.root_node().length
     }
 
     /// Returns the height of the proof list.
@@ -321,7 +390,7 @@ where
     /// assert_ne!(hash, default_hash);
     /// ```
     pub fn merkle_root(&self) -> Hash {
-        self.get_branch(self.root_key()).unwrap_or_default()
+        self.root_node().hash
     }
 
     /// Returns the proof of existence for the list element at the specified position.
@@ -352,7 +421,7 @@ where
                 index
             );
         }
-        self.construct_proof(self.root_key(), index, index + 1)
+        self.construct_proof(index, index + 1)
     }
 
     /// Returns the proof of existence for the list elements in the specified range.
@@ -390,7 +459,7 @@ where
             )
         }
 
-        self.construct_proof(self.root_key(), from, to)
+        self.construct_proof(from, to)
     }
 
     /// Returns an iterator over the list. The iterator element type is V.
@@ -443,9 +512,9 @@ impl<'a, V> ProofListIndex<&'a mut Fork, V>
 where
     V: StorageValue,
 {
-    fn set_len(&mut self, len: u64) {
-        self.base.put(&(), len);
-        self.length.set(Some(len));
+    fn set_root_node(&mut self, root_node: RootNode) {
+        self.base.put(&(), root_node);
+        self.root_node.set(Some(root_node));
     }
 
     fn set_branch(&mut self, key: ProofListKey, hash: Hash) {
@@ -470,13 +539,19 @@ where
     /// assert!(!index.is_empty());
     /// ```
     pub fn push(&mut self, value: V) {
-        let len = self.len();
-        self.set_len(len + 1);
+        let mut root_node = self.root_node();
+        let len = root_node.length;
+        root_node.length += 1;
+        self.set_root_node(root_node);
+
         let mut key = ProofListKey::new(1, len);
-        self.base.put(&key, value.hash());
+        let mut node_hash = value.hash();
+        self.base.put(&key, node_hash);
         self.base.put(&ProofListKey::leaf(len), value);
-        while key.height() < self.height() {
-            let hash = if key.is_left() {
+
+        let height = self.height();
+        while key.height() < height {
+            node_hash = if key.is_left() {
                 hash(self.get_branch_unchecked(key).as_ref())
             } else {
                 pair_hash(
@@ -484,9 +559,13 @@ where
                     &self.get_branch_unchecked(key),
                 )
             };
+
             key = key.parent();
-            self.set_branch(key, hash);
+            self.set_branch(key, node_hash);
         }
+
+        root_node.update_hash(&node_hash);
+        self.set_root_node(root_node);
     }
 
     /// Extends the proof list with the contents of an iterator.
@@ -543,12 +622,15 @@ where
                 index
             );
         }
+
         let mut key = ProofListKey::new(1, index);
-        self.base.put(&key, value.hash());
+        let mut node_hash = value.hash();
+        self.base.put(&key, node_hash);
         self.base.put(&ProofListKey::leaf(index), value);
+
         while key.height() < self.height() {
             let (left, right) = (key.as_left(), key.as_right());
-            let hash = if self.has_branch(right) {
+            node_hash = if self.has_branch(right) {
                 pair_hash(
                     &self.get_branch_unchecked(left),
                     &self.get_branch_unchecked(right),
@@ -557,8 +639,12 @@ where
                 hash(self.get_branch_unchecked(left).as_ref())
             };
             key = key.parent();
-            self.set_branch(key, hash);
+            self.set_branch(key, node_hash);
         }
+
+        let mut root_node = self.root_node();
+        root_node.update_hash(&node_hash);
+        self.set_root_node(root_node);
     }
 
     /// Clears the proof list, removing all values.
@@ -586,7 +672,7 @@ where
     /// assert!(index.is_empty());
     /// ```
     pub fn clear(&mut self) {
-        self.length.set(Some(0));
+        self.root_node.set(Some(RootNode::default()));
         self.base.clear()
     }
 }

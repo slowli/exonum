@@ -12,28 +12,237 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{de::Error, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{from_value, Error as SerdeJsonError, Value};
+use std::cmp::Ordering;
 
-use self::ListProof::*;
-use super::{super::StorageValue, key::ProofListKey, pair_hash};
+use super::{super::StorageValue, key::ProofListKey, pair_hash, RootNode};
 use crypto::{hash, Hash};
 
-/// An enum that represents a proof of existence for a proof list elements.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ListProof<V> {
-    /// A branch of proof in which both children contain requested elements.
-    Full(Box<ListProof<V>>, Box<ListProof<V>>),
-    /// A branch of proof in which only the left child contains requested elements.
-    Left(Box<ListProof<V>>, Option<Hash>),
-    /// A branch of proof in which only the right child contains requested elements.
-    Right(Hash, Box<ListProof<V>>),
-    /// A leaf of proof with requested element.
-    Leaf(V),
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct HashedEntry {
+    #[serde(flatten)]
+    key: ProofListKey,
+    hash: Hash,
+}
+
+impl HashedEntry {
+    fn new(key: ProofListKey, hash: Hash) -> Self {
+        HashedEntry { key, hash }
+    }
+}
+
+/// TODO
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListProof<V> {
+    hashes: Vec<HashedEntry>,
+    values: Vec<(u64, V)>,
+    height: u8,
+}
+
+fn merge<T, U>(first: T, second: U) -> impl Iterator<Item = Result<HashedEntry, ()>>
+where
+    T: Iterator<Item = HashedEntry>,
+    U: Iterator<Item = HashedEntry>,
+{
+    struct Merge<T, U> {
+        first: T,
+        second: U,
+        first_item: Option<HashedEntry>,
+        second_item: Option<HashedEntry>,
+    }
+
+    impl<T, U> Merge<T, U>
+    where
+        T: Iterator<Item = HashedEntry>,
+        U: Iterator<Item = HashedEntry>,
+    {
+        fn new(mut first: T, mut second: U) -> Self {
+            let (first_item, second_item) = (first.next(), second.next());
+            Merge {
+                first,
+                second,
+                first_item,
+                second_item,
+            }
+        }
+    }
+
+    impl<T, U> Iterator for Merge<T, U>
+    where
+        T: Iterator<Item = HashedEntry>,
+        U: Iterator<Item = HashedEntry>,
+    {
+        type Item = Result<HashedEntry, ()>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            match (self.first_item, self.second_item) {
+                (Some(x), Some(y)) => match x.key.cmp(&y.key) {
+                    Ordering::Less => {
+                        self.first_item = self.first.next();
+                        Some(Ok(x))
+                    }
+                    Ordering::Greater => {
+                        self.second_item = self.second.next();
+                        Some(Ok(y))
+                    }
+                    Ordering::Equal => Some(Err(())),
+                },
+
+                (Some(x), None) => {
+                    self.first_item = self.first.next();
+                    Some(Ok(x))
+                }
+
+                (None, Some(y)) => {
+                    self.second_item = self.second.next();
+                    Some(Ok(y))
+                }
+
+                (None, None) => None,
+            }
+        }
+    }
+
+    Merge::new(first, second)
+}
+
+fn hash_layer(layer: &[HashedEntry]) -> Result<Vec<HashedEntry>, ListProofError> {
+    let mut hashed = Vec::with_capacity(layer.len() / 2 + 1);
+
+    for chunk in layer.chunks(2) {
+        match *chunk {
+            [x, y] => {
+                if !x.key.is_left() || y.key.index() != x.key.index() + 1 {
+                    return Err(ListProofError::MissingEntry);
+                }
+
+                hashed.push(HashedEntry::new(
+                    x.key.parent(),
+                    pair_hash(&x.hash, &y.hash),
+                ));
+            }
+
+            [last] => {
+                if !last.key.is_left() {
+                    return Err(ListProofError::MissingEntry);
+                }
+
+                hashed.push(HashedEntry::new(
+                    last.key.parent(),
+                    hash(last.hash.as_ref()),
+                ));
+            }
+
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(hashed)
+}
+
+impl<V: StorageValue> ListProof<V> {
+    pub(super) fn new<I>(values: I, height: u8) -> Self
+    where
+        I: IntoIterator<Item = (u64, V)>,
+    {
+        ListProof {
+            values: values.into_iter().collect(),
+            height,
+            hashes: vec![],
+        }
+    }
+
+    pub(super) fn push_hash(&mut self, height: u8, index: u64, hash: Hash) -> &mut Self {
+        debug_assert!(height > 0);
+        debug_assert!(height < self.height);
+
+        let key = ProofListKey::new(height, index);
+        debug_assert!(
+            if let Some(&HashedEntry { key: last_key, .. }) = self.hashes.last() {
+                key > last_key
+            } else {
+                true
+            }
+        );
+
+        self.hashes.push(HashedEntry::new(key, hash));
+        self
+    }
+
+    fn collect(&self) -> Result<Hash, ListProofError> {
+        let ordered = self.values
+            .windows(2)
+            .all(|window| window[0].0 < window[1].0);
+        if !ordered {
+            return Err(ListProofError::Unordered);
+        }
+
+        let ordered = self.hashes
+            .windows(2)
+            .all(|window| window[0].key < window[1].key);
+        if !ordered {
+            return Err(ListProofError::Unordered);
+        }
+
+        for &HashedEntry { key, .. } in &self.hashes {
+            let height = key.height();
+
+            if height == 0 {
+                return Err(ListProofError::UnexpectedLeaf);
+            }
+            if height >= self.height || key.index() >= (1 << (self.height - height)) {
+                return Err(ListProofError::UnexpectedBranch);
+            }
+        }
+
+        let mut layer: Vec<_> = self.values
+            .iter()
+            .map(|(i, value)| HashedEntry::new(ProofListKey::new(1, *i), value.hash()))
+            .collect();
+
+        let mut hashes = self.hashes.clone();
+        let mut index_bound = None;
+
+        for height in 1..self.height {
+            let split_index = hashes.iter().position(|entry| entry.key.height() > height);
+            let remaining_hashes = if let Some(i) = split_index {
+                hashes.split_off(i)
+            } else {
+                vec![]
+            };
+
+            if let (Some(last), Some(bound)) = (hashes.last(), index_bound) {
+                if last.key.index() > bound {
+                    return Err(ListProofError::UnexpectedBranch);
+                }
+            }
+
+            let merged = merge(layer.into_iter(), hashes.into_iter())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ListProofError::DuplicateItem)?;
+
+            if index_bound.is_none() && merged.len() % 2 == 1 {
+                index_bound = Some(merged.last().unwrap().key.index());
+            }
+            if let Some(ref mut bound) = index_bound {
+                if *bound == 0 {
+                    // We can arrive at a single element only at the last layer.
+                    return Err(ListProofError::MissingEntry);
+                }
+                *bound >>= 1;
+            }
+
+            layer = hash_layer(&merged)?;
+            hashes = remaining_hashes;
+        }
+
+        debug_assert_eq!(layer.len(), 1);
+        debug_assert_eq!(layer[0].key, ProofListKey::new(self.height, 0));
+        Ok(layer[0].hash)
+    }
 }
 
 /// An error that is returned when the list proof is invalid.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ListProofError {
     /// The proof is too short and does not correspond to the height of the tree.
     UnexpectedLeaf,
@@ -41,188 +250,98 @@ pub enum ListProofError {
     UnexpectedBranch,
     /// The hash of the proof is not equal to the trusted root hash.
     UnmatchedRootHash,
+
+    /// TODO
+    Unordered,
+    /// TODO
+    DuplicateItem,
+    /// TODO
+    MissingEntry,
 }
 
 impl<V: StorageValue> ListProof<V> {
-    fn collect<'a>(
-        &'a self,
-        key: ProofListKey,
-        vec: &mut Vec<(u64, &'a V)>,
-    ) -> Result<Hash, ListProofError> {
-        if key.height() == 0 {
-            return Err(ListProofError::UnexpectedBranch);
-        }
-        let hash = match *self {
-            Full(ref left, ref right) => pair_hash(
-                &left.collect(key.left(), vec)?,
-                &right.collect(key.right(), vec)?,
-            ),
-            Left(ref left, Some(ref right)) => pair_hash(&left.collect(key.left(), vec)?, right),
-            Left(ref left, None) => hash(left.collect(key.left(), vec)?.as_ref()),
-            Right(ref left, ref right) => pair_hash(left, &right.collect(key.right(), vec)?),
-            Leaf(ref value) => {
-                if key.height() > 1 {
-                    return Err(ListProofError::UnexpectedLeaf);
-                }
-                vec.push((key.index(), value));
-                value.hash()
-            }
-        };
-        Ok(hash)
-    }
-
     /// Verifies the correctness of the proof by the trusted Merkle root hash and the number of
     /// elements in the tree.
     ///
     /// If the proof is valid, a vector with indices and references to elements is returned.
     /// Otherwise, `Err` is returned.
-    pub fn validate(&self, merkle_root: Hash, len: u64) -> Result<Vec<(u64, &V)>, ListProofError> {
-        let mut vec = Vec::new();
-        let height = len.next_power_of_two().trailing_zeros() as u8 + 1;
-        if self.collect(ProofListKey::new(height, 0), &mut vec)? != merkle_root {
+    pub fn validate(&self, merkle_root: Hash) -> Result<&[(u64, V)], ListProofError> {
+        let tree_root = self.collect()?;
+
+        if RootNode::node_hash(&tree_root, self.height) != merkle_root {
             return Err(ListProofError::UnmatchedRootHash);
         }
-        Ok(vec)
+        Ok(&self.values)
     }
 }
 
-impl<V: Serialize> Serialize for ListProof<V> {
-    fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use self::ListProof::*;
-        let mut state;
-        match *self {
-            Full(ref left_proof, ref right_proof) => {
-                state = ser.serialize_struct("Full", 2)?;
-                state.serialize_field("left", left_proof)?;
-                state.serialize_field("right", right_proof)?;
-            }
-            Left(ref left_proof, ref option_hash) => {
-                if let Some(ref hash) = *option_hash {
-                    state = ser.serialize_struct("Left", 2)?;
-                    state.serialize_field("left", left_proof)?;
-                    state.serialize_field("right", hash)?;
-                } else {
-                    state = ser.serialize_struct("Left", 1)?;
-                    state.serialize_field("left", left_proof)?;
-                }
-            }
-            Right(ref hash, ref right_proof) => {
-                state = ser.serialize_struct("Right", 2)?;
-                state.serialize_field("left", hash)?;
-                state.serialize_field("right", right_proof)?;
-            }
-            Leaf(ref val) => {
-                state = ser.serialize_struct("Leaf", 1)?;
-                state.serialize_field("val", val)?;
-            }
-        }
-        state.end()
-    }
-}
-impl<'a, V> Deserialize<'a> for ListProof<V>
-where
-    for<'de> V: Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'a>,
-    {
-        fn format_err_string(type_str: &str, value: &Value, err: &SerdeJsonError) -> String {
-            format!(
-                "Couldn't deserialize {} from serde_json::Value: {}, error: {}",
-                type_str, value, err
-            )
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crypto::CryptoHash;
 
-        let json: Value = <Value as Deserialize>::deserialize(deserializer)?;
-        if !json.is_object() {
-            return Err(D::Error::custom(format!(
-                "Invalid json: it is expected to be json \
-                 Object. json: {:?}",
-                json
-            )));
-        }
-        let map_key_value = json.as_object().unwrap();
-        let res: Self = match map_key_value.len() {
-            2 => {
-                let left_value: &Value = match map_key_value.get("left") {
-                    None => {
-                        return Err(D::Error::custom(format!(
-                            "Invalid json: Key {} not found. \
-                             Value: {:?}",
-                            "left", json
-                        )))
-                    }
-                    Some(left) => left,
-                };
-                let right_value: &Value = match map_key_value.get("right") {
-                    None => {
-                        return Err(D::Error::custom(format!(
-                            "Invalid json: Key {} not found. \
-                             Value: {:?}",
-                            "right", json
-                        )))
-                    }
-                    Some(right) => right,
-                };
-                if right_value.is_string() {
-                    let left_proof: ListProof<V> = from_value(left_value.clone()).map_err(|err| {
-                        D::Error::custom(format_err_string("ListProof", left_value, &err))
-                    })?;
-                    let right_hash: Hash = from_value(right_value.clone()).map_err(|err| {
-                        D::Error::custom(format_err_string("Hash", right_value, &err))
-                    })?;
-                    Left(Box::new(left_proof), Some(right_hash))
-                } else if left_value.is_string() {
-                    let right_proof: ListProof<V> = from_value(right_value.clone()).map_err(
-                        |err| D::Error::custom(format_err_string("ListProof", right_value, &err)),
-                    )?;
-                    let left_hash: Hash = from_value(left_value.clone()).map_err(|err| {
-                        D::Error::custom(format_err_string("Hash", left_value, &err))
-                    })?;
-                    Right(left_hash, Box::new(right_proof))
-                } else {
-                    let left_proof = from_value(left_value.clone()).map_err(|err| {
-                        D::Error::custom(format_err_string("ListProof", left_value, &err))
-                    })?;
-                    let right_proof = from_value(right_value.clone()).map_err(|err| {
-                        D::Error::custom(format_err_string("ListProof", right_value, &err))
-                    })?;
-                    Full(Box::new(left_proof), Box::new(right_proof))
-                }
-            }
-            1 => {
-                if map_key_value.get("val").is_none() && map_key_value.get("left").is_none() {
-                    return Err(D::Error::custom(format!(
-                        "Invalid json: unknown key met. \
-                         Expected: {} or {}. json: {:?}",
-                        "val", "left", json
-                    )));
-                }
-                if let Some(leaf_value) = map_key_value.get("val") {
-                    let val: V = from_value(leaf_value.clone())
-                        .map_err(|err| D::Error::custom(format_err_string("V", leaf_value, &err)))?;
-                    Leaf(val)
-                } else {
-                    // "left" is present
-                    let left_value = map_key_value.get("left").unwrap();
-                    let left_proof: ListProof<V> = from_value(left_value.clone()).map_err(|err| {
-                        D::Error::custom(format_err_string("ListProof", left_value, &err))
-                    })?;
-                    Left(Box::new(left_proof), None)
-                }
-            }
-            _ => {
-                return Err(D::Error::custom(format!(
-                    "Invalid json: Number of keys should be \
-                     either 1 or 2. json: {:?}",
-                    json
-                )))
-            }
-        };
-        Ok(res)
+    fn entry(height: u8, index: u64) -> HashedEntry {
+        HashedEntry::new(ProofListKey::new(height, index), index.hash())
+    }
+
+    #[test]
+    fn merge_example() {
+        let first = vec![entry(1, 0), entry(1, 5), entry(2, 5)].into_iter();
+        let second = vec![
+            entry(1, 1),
+            entry(2, 2),
+            entry(2, 3),
+            entry(3, 0),
+            entry(4, 1),
+        ].into_iter();
+        let merged = merge(first, second).collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(
+            merged,
+            vec![
+                entry(1, 0),
+                entry(1, 1),
+                entry(1, 5),
+                entry(2, 2),
+                entry(2, 3),
+                entry(2, 5),
+                entry(3, 0),
+                entry(4, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_layer_example() {
+        let layer = vec![
+            entry(1, 0),
+            entry(1, 1),
+            entry(1, 6),
+            entry(1, 7),
+            entry(1, 8),
+        ];
+        let hashed = hash_layer(&layer).unwrap();
+        assert!(hashed.iter().map(|entry| entry.key,).eq(vec![
+            ProofListKey::new(2, 0),
+            ProofListKey::new(2, 3),
+            ProofListKey::new(2, 4),
+        ],));
+
+        assert_eq!(hashed[0].hash, pair_hash(&0u64.hash(), &1u64.hash()));
+        assert_eq!(hashed[2].hash, hash(8u64.hash().as_ref()));
+
+        // layer[0] has odd index
+        let layer = vec![entry(1, 1), entry(1, 2)];
+        assert!(hash_layer(&layer).is_err());
+
+        // layer[1] is not adjacent to layer[0]
+        let layer = vec![entry(1, 0), entry(1, 2)];
+        assert!(hash_layer(&layer).is_err());
+        let layer = vec![entry(1, 0), entry(1, 3)];
+        assert!(hash_layer(&layer).is_err());
+
+        // layer[-1] has odd index
+        let layer = vec![entry(1, 0), entry(1, 1), entry(1, 7)];
+        assert!(hash_layer(&layer).is_err());
     }
 }
