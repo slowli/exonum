@@ -453,7 +453,6 @@ fn test_explorer_blocks() {
     assert_eq!(blocks[0].height(), Height(2));
     assert_eq!(*blocks[0].prev_hash(), blocks[1].hash());
     assert_eq!(blocks[0].tx_count(), 1);
-    assert_eq!(*blocks[0].tx_hash(), tx.hash());
     assert_eq!(range.start, Height(0));
     assert_eq!(range.end, Height(3));
 
@@ -558,7 +557,6 @@ fn test_explorer_single_block() {
         let block = explorer.block(Height(1)).unwrap();
         assert_eq!(block.height(), Height(1));
         assert_eq!(block.len(), 1);
-        assert_eq!(*block.header().tx_hash(), tx.hash());
         assert_eq!(&*block.transaction_hashes(), &[tx.hash()]);
 
         let mut validators = HashSet::new();
@@ -626,10 +624,7 @@ fn test_explorer_transaction_info() {
     assert!(
         committed
             .location_proof()
-            .validate(
-                *block.header().tx_hash(),
-                u64::from(block.header().tx_count())
-            )
+            .validate(*block.header().tx_hash())
             .is_ok()
     );
 }
