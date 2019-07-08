@@ -104,13 +104,11 @@ fn generate_mod_rs<P: AsRef<Path>, Q: AsRef<Path>>(
 /// // If you use types from `exonum` .proto files.
 /// use exonum::proto::schema::*;
 /// ```
-pub fn protobuf_generate<P, R, I, T>(input_dir: P, includes: I, mod_file_name: T)
-where
-    P: AsRef<Path>,
-    R: AsRef<Path>,
-    I: IntoIterator<Item = R>,
-    T: AsRef<str>,
-{
+pub fn protobuf_generate(
+    input_dir: impl AsRef<Path>,
+    includes: impl IntoIterator<Item = impl AsRef<Path>>,
+    mod_file_name: impl AsRef<str>,
+) {
     let out_dir = env::var("OUT_DIR")
         .map(PathBuf::from)
         .expect("Unable to get OUT_DIR");
@@ -135,6 +133,8 @@ where
                     .to_str()
                     .expect("Include dir name is not convertible to &str")
             })
+            // Workaround for protoc on FreeBSD
+            .chain(vec!["/usr/local/include"].into_iter())
             .collect::<Vec<_>>(),
         customize: Customize {
             serde_derive: Some(true),
